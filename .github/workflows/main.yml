@@ -1,0 +1,303 @@
+package com.tcl.smartremote;
+
+import android.content.Context;
+import android.content.SharedPreferences;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.math.BigInteger;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.KeyStore;
+import java.security.MessageDigest;
+import java.security.PrivateKey;
+import java.security.SecureRandom;
+import java.security.cert.X509Certificate;
+import java.security.interfaces.RSAPublicKey;
+import java.util.Arrays;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
+import org.bouncycastle.asn1.x500.X500Name;
+import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
+import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder;
+import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
+
+/** Android TV Remote Service v2 over TLS: manual IP, pairing and key control. */
+final class GoogleRemote {
+    interface Listener {
+        void requestPin();
+        void connected();
+        void failed(String reason);
+    }
+    private final Context context;
+    private final Listener listener;
+    private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private final ExecutorService writeWorker = Executors.newSingleThreadExecutor();
+    private final char[] password = "tcl-remote-client".toCharArray();
+    private final SharedPreferences prefs;
+    private String host;
+    private KeyStore identity;
+    private X509Certificate ownCertificate;
+    private SSLSocket pairSocket,remoteSocket;
+    private X509Certificate pairedPeer;
+    private volatile boolean ready = false;
+    private volatile boolean intentionalClose=false;
+    private final Object outputLock = new Object();
+
+    GoogleRemote(Context context, Listener listener) {
+        this.context=context.getApplicationContext();
+        this.listener=listener;
+        this.prefs=this.context.getSharedPreferences("google_remote",Context.MODE_PRIVATE);
+    }
+    boolean isReady(){ return ready; }
+    String lastPairedHost(){return prefs.getString("paired_host","");}
+    void start(String ip){
+        worker.execute(()->{
+            intentionalClose=true;
+            closeSockets();
+            intentionalClose=false;
+            host=ip;
+            try {
+                loadIdentity();
+                if (ip.equals(lastPairedHost())) {
+                    try { connectRemote();return; }
+                    catch(Exception ignored){closeSockets();}
+                }
+                beginPairing();
+            }catch(Exception e){failure(e);}
+        });
+    }
+    void enterPin(String pin){
+        worker.execute(()->{
+            try {
+                if(pairSocket==null||pairedPeer==null)throw new IllegalStateException("ابدأ الاقتران مجددًا");
+                byte[] secret=proof(pin);
+                send(pairSocket, outer(40,Proto.obj(1,secret)));
+                Proto ack=Proto.parse(readFrame(pairSocket.getInputStream()));
+                statusOk(ack);
+                if(!ack.has(41))throw new IllegalStateException("رفض التلفاز رمز الاقتران");
+                String fingerprint=hex(MessageDigest.getInstance("SHA-256").digest(pairedPeer.getEncoded()));
+                prefs.edit().putString("paired_host",host).putString("peer_"+host,fingerprint).apply();
+                try{pairSocket.close();}catch(Exception ignored){}
+                pairSocket=null;
+                connectRemote();
+            }catch(Exception e){failure(e);}
+        });
+    }
+    private void beginPairing() throws Exception {
+        pairSocket=tls(6467,false);
+        pairedPeer=(X509Certificate)pairSocket.getSession().getPeerCertificates()[0];
+        send(pairSocket,outer(10,Proto.concat(Proto.obj(1,"atvremote".getBytes(StandardCharsets.UTF_8)),
+                                             Proto.obj(2,"TCL Smart Remote".getBytes(StandardCharsets.UTF_8)))));
+        int rounds=0;
+        while(rounds++<12){
+            Proto reply=Proto.parse(readFrame(pairSocket.getInputStream()));
+            statusOk(reply);
+            if(reply.has(11)) {
+                byte[] encoding=Proto.concat(Proto.num(1,3),Proto.num(2,6));
+                byte[] options=Proto.concat(Proto.obj(1,encoding),Proto.num(3,1));
+                send(pairSocket,outer(20,options));
+            }else if(reply.has(20)){
+                byte[] encoding=Proto.concat(Proto.num(1,3),Proto.num(2,6));
+                byte[] configuration=Proto.concat(Proto.obj(1,encoding),Proto.num(2,1));
+                send(pairSocket,outer(30,configuration));
+            }else if(reply.has(31)){
+                listener.requestPin();
+                return;
+            }else throw new IllegalStateException("رسالة اقتران غير متوقعة");
+        }
+        throw new IllegalStateException("لم يكتمل بدء الاقتران");
+    }
+    private byte[] proof(String raw) throws Exception {
+        String pin=raw.trim().toUpperCase(java.util.Locale.ROOT);
+        if(!pin.matches("[0-9A-F]{6}"))throw new IllegalArgumentException("رمز الشاشة يتكون من 6 خانات ست عشرية");
+        RSAPublicKey a=(RSAPublicKey)ownCertificate.getPublicKey();
+        RSAPublicKey b=(RSAPublicKey)pairedPeer.getPublicKey();
+        MessageDigest d=MessageDigest.getInstance("SHA-256");
+        d.update(unsigned(a.getModulus()));d.update(unsigned(a.getPublicExponent()));
+        d.update(unsigned(b.getModulus()));d.update(unsigned(b.getPublicExponent()));
+        d.update(new byte[]{(byte)Integer.parseInt(pin.substring(2,4),16),
+                            (byte)Integer.parseInt(pin.substring(4,6),16)});
+        byte[] hash=d.digest();
+        if((hash[0]&255)!=Integer.parseInt(pin.substring(0,2),16))
+            throw new IllegalArgumentException("رمز الاقتران لا يطابق الشاشة");
+        return hash;
+    }
+    private byte[] unsigned(BigInteger n){
+        byte[] b=n.toByteArray();
+        return b.length>1&&b[0]==0?Arrays.copyOfRange(b,1,b.length):b;
+    }
+    private void connectRemote() throws Exception {
+        remoteSocket=tls(6466,true);
+        int rounds=0;
+        ready=false;
+        while(!ready&&rounds++<15){
+            Proto p=Proto.parse(readFrame(remoteSocket.getInputStream()));
+            respond(p);
+        }
+        if(!ready)throw new IllegalStateException("لم يؤكد التلفاز جلسة التحكم");
+        remoteSocket.setSoTimeout(0);
+        listener.connected();
+        final SSLSocket session=remoteSocket;
+        Thread reader=new Thread(()->{
+            try {
+                while(!session.isClosed())respond(Proto.parse(readFrame(session.getInputStream())));
+            }catch(Exception e){if(!intentionalClose)failure(e);}
+        },"google-tv-ping-reader");
+        reader.setDaemon(true);reader.start();
+    }
+    private void respond(Proto p) throws Exception {
+        if(p.has(1)){
+            byte[] info=Proto.concat(Proto.num(3,1),Proto.obj(4,"1".getBytes(StandardCharsets.UTF_8)),
+                Proto.obj(5,"atvremote".getBytes(StandardCharsets.UTF_8)),
+                Proto.obj(6,"1.0.0".getBytes(StandardCharsets.UTF_8)));
+            send(remoteSocket,Proto.obj(1,Proto.concat(Proto.num(1,611),Proto.obj(2,info))));
+        }else if(p.has(2)){
+            send(remoteSocket,Proto.obj(2,Proto.num(1,611)));
+        }else if(p.has(8)){
+            Proto q=Proto.parse(p.bytes(8));
+            send(remoteSocket,Proto.obj(9,Proto.num(1,q.number(1,0))));
+        }else if(p.has(40)){
+            ready=true;
+        }
+    }
+    void key(int code) {
+        if(!ready||remoteSocket==null)return;
+        final SSLSocket session=remoteSocket;
+        final byte[] frame=Proto.obj(10,Proto.concat(Proto.num(1,code),Proto.num(2,3)));
+        writeWorker.execute(()->{
+            try{send(session,frame);}catch(Exception e){failure(e);}
+        });
+    }
+    private void statusOk(Proto p){
+        long status=p.number(2,200);
+        if(status!=200)throw new IllegalStateException("رفض التلفاز عملية الاقتران: "+status);
+    }
+    private static byte[] outer(int field,byte[] payload){
+        return Proto.concat(Proto.num(1,2),Proto.num(2,200),Proto.obj(field,payload));
+    }
+    private static String hex(byte[] bytes){
+        StringBuilder s=new StringBuilder();for(byte b:bytes)s.append(String.format("%02x",b&255));return s.toString();
+    }
+    private SSLSocket tls(int port,boolean checkPinned) throws Exception {
+        KeyManagerFactory kmf=KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+        kmf.init(identity,password);
+        X509TrustManager manager=new X509TrustManager(){
+            @Override public void checkClientTrusted(X509Certificate[] chain,String auth){}
+            @Override public void checkServerTrusted(X509Certificate[] chain,String auth){}
+            @Override public X509Certificate[] getAcceptedIssuers(){return new X509Certificate[0];}
+        };
+        SSLContext ssl=SSLContext.getInstance("TLS");
+        ssl.init(kmf.getKeyManagers(),new TrustManager[]{manager},new SecureRandom());
+        SSLSocket socket=(SSLSocket)ssl.getSocketFactory().createSocket();
+        socket.connect(new InetSocketAddress(host,port),4500);
+        socket.setSoTimeout(8000);
+        socket.startHandshake();
+        if(checkPinned){
+            String pinned=prefs.getString("peer_"+host,"");
+            X509Certificate peer=(X509Certificate)socket.getSession().getPeerCertificates()[0];
+            String actual=hex(MessageDigest.getInstance("SHA-256").digest(peer.getEncoded()));
+            if(!pinned.isEmpty()&&!pinned.equals(actual)){
+                socket.close();throw new SecurityException("تغيرت شهادة التلفاز؛ يلزم إعادة الاقتران");
+            }
+        }
+        return socket;
+    }
+    private void loadIdentity() throws Exception {
+        File f=new File(context.getFilesDir(),"tcl_remote_client.p12");
+        identity=KeyStore.getInstance("PKCS12");
+        if(f.exists()){
+            try(InputStream in=new java.io.FileInputStream(f)){identity.load(in,password);}
+            ownCertificate=(X509Certificate)identity.getCertificate("remote");
+            if(ownCertificate==null)throw new IllegalStateException("الشهادة المخزنة غير صالحة");
+            return;
+        }
+        KeyPairGenerator kpg=KeyPairGenerator.getInstance("RSA");kpg.initialize(2048);
+        KeyPair kp=kpg.generateKeyPair();
+        long now=System.currentTimeMillis();
+        X500Name dn=new X500Name("CN=tclremote");
+        X509Certificate cert=new JcaX509CertificateConverter().getCertificate(
+            new JcaX509v3CertificateBuilder(dn,BigInteger.valueOf(now),
+                new Date(now-86400000L),new Date(now+315360000000L),dn,kp.getPublic())
+                .build(new JcaContentSignerBuilder("SHA256withRSA").build(kp.getPrivate())));
+        identity.load(null,null);
+        identity.setKeyEntry("remote",kp.getPrivate(),password,new java.security.cert.Certificate[]{cert});
+        try(OutputStream out=new java.io.FileOutputStream(f)){identity.store(out,password);}
+        ownCertificate=cert;
+    }
+    private static void send(SSLSocket s,byte[] body) throws Exception {
+        if(s==null)throw new IllegalStateException("جلسة التلفاز مغلقة");
+        synchronized(s.getOutputStream()){
+            OutputStream out=s.getOutputStream();
+            out.write(Proto.varint(body.length));out.write(body);out.flush();
+        }
+    }
+    private static byte[] readFrame(InputStream in) throws Exception {
+        long length=Proto.readVarint(in);
+        if(length<0||length>1024*1024)throw new IllegalStateException("طول رسالة غير صحيح");
+        byte[] bytes=new byte[(int)length];int pos=0;
+        while(pos<bytes.length){int n=in.read(bytes,pos,bytes.length-pos);if(n<0)throw new java.io.EOFException();pos+=n;}
+        return bytes;
+    }
+    private void failure(Exception e){
+        ready=false;closeSockets();
+        if(!intentionalClose)listener.failed(e.getMessage()==null?e.getClass().getSimpleName():e.getMessage());
+    }
+    void disconnect(){intentionalClose=true;ready=false;closeSockets();}
+    private void closeSockets(){
+        ready=false;
+        try{if(pairSocket!=null)pairSocket.close();}catch(Exception ignored){}
+        try{if(remoteSocket!=null)remoteSocket.close();}catch(Exception ignored){}
+        pairSocket=null;remoteSocket=null;
+    }
+    void close(){disconnect();worker.shutdownNow();writeWorker.shutdownNow();}
+
+    /** Strict minimal protobuf encoder and decoder (varint/length-delimited). */
+    static final class Proto {
+        final Map<Integer,byte[]> blobs=new HashMap<>();
+        final Map<Integer,Long> numbers=new HashMap<>();
+        boolean has(int field){return blobs.containsKey(field)||numbers.containsKey(field);}
+        byte[] bytes(int field){return blobs.getOrDefault(field,new byte[0]);}
+        long number(int field,long fallback){return numbers.getOrDefault(field,fallback);}
+        static byte[] concat(byte[]... parts){
+            ByteArrayOutputStream b=new ByteArrayOutputStream();for(byte[] p:parts)b.write(p,0,p.length);return b.toByteArray();
+        }
+        static byte[] varint(long n){
+            ByteArrayOutputStream b=new ByteArrayOutputStream();
+            while(true){int x=(int)(n&127);n>>>=7;if(n==0){b.write(x);return b.toByteArray();}b.write(x|128);}
+        }
+        static byte[] num(int field,long n){return concat(varint(((long)field)<<3),varint(n));}
+        static byte[] obj(int field,byte[] b){return concat(varint((field<<3)|2),varint(b.length),b);}
+        static long readVarint(InputStream in) throws Exception {
+            long result=0;int shift=0;
+            while(shift<=63){int x=in.read();if(x<0)throw new java.io.EOFException();
+                result |= (long)(x&127)<<shift;if((x&128)==0)return result;shift+=7;}
+            throw new IllegalStateException("Invalid varint");
+        }
+        static Proto parse(byte[] data) throws Exception {
+            java.io.ByteArrayInputStream in=new java.io.ByteArrayInputStream(data);
+            Proto p=new Proto();
+            while(in.available()>0){long tag=readVarint(in);int f=(int)(tag>>>3);int wire=(int)(tag&7);
+                if(f<1)throw new IllegalArgumentException("Invalid field");
+                if(wire==0)p.numbers.put(f,readVarint(in));
+                else if(wire==2){long len=readVarint(in);if(len>in.available()||len<0)throw new java.io.EOFException();
+                    byte[] b=new byte[(int)len];if(in.read(b)!=len)throw new java.io.EOFException();p.blobs.put(f,b);}
+                else if(wire==5){if(in.skip(4)!=4)throw new java.io.EOFException();}
+                else if(wire==1){if(in.skip(8)!=8)throw new java.io.EOFException();}
+                else throw new IllegalStateException("Unsupported protobuf wire type");
+            }
+            return p;
+        }
+    }
+}
